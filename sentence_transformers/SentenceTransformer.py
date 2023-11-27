@@ -583,6 +583,7 @@ class SentenceTransformer(nn.Sequential):
             optimizer_params : Dict[str, object]= {'lr': 2e-5},
             weight_decay: float = 0.01,
             evaluation_steps: int = 0,
+            accumulate_batches: int = 1,
             output_path: str = None,
             save_best_model: bool = True,
             max_grad_norm: float = 1,
@@ -609,6 +610,7 @@ class SentenceTransformer(nn.Sequential):
         :param optimizer_params: Optimizer parameters
         :param weight_decay: Weight decay for model parameters
         :param evaluation_steps: If > 0, evaluate the model using evaluator after each number of training steps
+        :param accumulate_batches: Accumulate gradients over several batches. Simulate higher batch sizes by accumulating gradients over several smaller batches.
         :param output_path: Storage path for the model and evaluation files
         :param save_best_model: If true, the best model (according to evaluator) is stored at output_path
         :param max_grad_norm: Used for gradient normalization.
@@ -707,28 +709,29 @@ class SentenceTransformer(nn.Sequential):
                     labels = labels.to(self._target_device)
                     features = list(map(lambda batch: batch_to_device(batch, self._target_device), features))
 
-                    if use_amp:
-                        with autocast():
+                    if (training_steps % accumulate_batches) == 0 or training_steps == steps_per_epoch:
+                        if use_amp:
+                            with autocast():
+                                loss_value = loss_model(features, labels)
+
+                            scale_before_step = scaler.get_scale()
+                            scaler.scale(loss_value).backward()
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
+                            scaler.step(optimizer)
+                            scaler.update()
+
+                            skip_scheduler = scaler.get_scale() != scale_before_step
+                        else:
                             loss_value = loss_model(features, labels)
+                            loss_value.backward()
+                            torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
+                            optimizer.step()
 
-                        scale_before_step = scaler.get_scale()
-                        scaler.scale(loss_value).backward()
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
-                        scaler.step(optimizer)
-                        scaler.update()
+                        optimizer.zero_grad()
 
-                        skip_scheduler = scaler.get_scale() != scale_before_step
-                    else:
-                        loss_value = loss_model(features, labels)
-                        loss_value.backward()
-                        torch.nn.utils.clip_grad_norm_(loss_model.parameters(), max_grad_norm)
-                        optimizer.step()
-
-                    optimizer.zero_grad()
-
-                    if not skip_scheduler:
-                        scheduler.step()
+                        if not skip_scheduler:
+                            scheduler.step()
 
                 training_steps += 1
                 global_step += 1
