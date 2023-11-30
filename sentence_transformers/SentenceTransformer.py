@@ -584,6 +584,7 @@ class SentenceTransformer(nn.Sequential):
             weight_decay: float = 0.01,
             evaluation_steps: int = 0,
             accumulate_batches: int = 1,
+            loss_is_batch_mean: bool = True,
             output_path: str = None,
             save_best_model: bool = True,
             max_grad_norm: float = 1,
@@ -611,6 +612,7 @@ class SentenceTransformer(nn.Sequential):
         :param weight_decay: Weight decay for model parameters
         :param evaluation_steps: If > 0, evaluate the model using evaluator after each number of training steps
         :param accumulate_batches: Accumulate gradients over several batches. Simulate higher batch sizes by accumulating gradients over several smaller batches.
+        :param loss_is_batch_mean: Indicate if the loss function is calculating a mean value over the batch or a sum.
         :param output_path: Storage path for the model and evaluation files
         :param save_best_model: If true, the best model (according to evaluator) is stored at output_path
         :param max_grad_norm: Used for gradient normalization.
@@ -630,6 +632,10 @@ class SentenceTransformer(nn.Sequential):
         for dataloader, loss in train_objectives:
             info_loss_functions.extend(ModelCardTemplate.get_train_objective_info(dataloader, loss))
         info_loss_functions = "\n\n".join([text for text in info_loss_functions])
+
+        if accumulate_batches > 1:
+            # Warmup steps must be scaled by number of accumulate batches because optimizer.step() is called only every accumulate_batches
+            warmup_steps = warmup_steps // accumulate_batches
 
         info_fit_parameters = json.dumps({"evaluator": fullname(evaluator), "epochs": epochs, "steps_per_epoch": steps_per_epoch, "scheduler": scheduler, "warmup_steps": warmup_steps, "optimizer_class": str(optimizer_class),  "optimizer_params": optimizer_params, "weight_decay": weight_decay, "evaluation_steps": evaluation_steps, "max_grad_norm": max_grad_norm }, indent=4, sort_keys=True)
         self._model_card_text = None
@@ -683,7 +689,12 @@ class SentenceTransformer(nn.Sequential):
 
         num_train_objectives = len(train_objectives)
 
-        skip_scheduler = False
+        # Accumulate loss and if the loss is not a batch mean, scale by number of accumulation steps
+        if loss_is_batch_mean:
+            loss_batch_scaling = 1
+        else:
+            loss_batch_scaling = accumulate_batches
+
         for epoch in trange(epochs, desc="Epoch", disable=not show_progress_bar):
             training_steps = 0
 
@@ -711,10 +722,7 @@ class SentenceTransformer(nn.Sequential):
 
                     if use_amp:
                         with autocast():
-                            # Accumulate loss and scale by number of accumulation steps
-                            loss_value = loss_model(features, labels) / accumulate_batches
-
-                        #scale_before_step = scaler.get_scale()
+                            loss_value = loss_model(features, labels) / loss_batch_scaling
                         scaler.scale(loss_value).backward()
 
                         if (training_steps % accumulate_batches) == 0 or training_steps == steps_per_epoch:
@@ -724,11 +732,9 @@ class SentenceTransformer(nn.Sequential):
                             scaler.update()
                             optimizer.zero_grad()
                             scheduler.step()
-                            
-                        # Note: No clue what is the intention with skipping LR schedule steps
-                        #skip_scheduler = scaler.get_scale() != scale_before_step
+
                     else:
-                        loss_value = loss_model(features, labels) / accumulate_batches
+                        loss_value = loss_model(features, labels) / loss_batch_scaling
                         loss_value.backward()
 
                         if (training_steps % accumulate_batches) == 0 or training_steps == steps_per_epoch:
@@ -736,9 +742,6 @@ class SentenceTransformer(nn.Sequential):
                             optimizer.step()
                             optimizer.zero_grad()
                             scheduler.step()
-
-                        #if not skip_scheduler:
-                        #    scheduler.step()
 
                 training_steps += 1
                 global_step += 1
